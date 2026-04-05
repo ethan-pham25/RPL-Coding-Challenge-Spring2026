@@ -55,7 +55,54 @@ class SharedBuffer(shared_memory.SharedMemory):
         - `cache_align` / `cache_size`: optional metadata-layout knobs; you may ignore
           them internally as long as validation and behavior remain correct
         """
-        raise NotImplementedError("TODO: implement SharedBuffer.__init__")
+
+        if size < 0:
+            raise ValueError(f'Size of buffer in bytes must be positive, was: {size}')
+
+        if num_readers < 0:
+            raise ValueError(f'Number of readers must be positive, was: {num_readers}')
+
+        # Reject out of range reader index (0-indexed)
+        if reader < -1:
+            raise ValueError(f'Reader index must be positive or _NO_READER (-1)'
+                             f'for writer, was: {reader}')
+        elif reader >= num_readers:
+            raise ValueError(f'Reader index must be less than the number of readers, was: {reader}')
+
+        # When cache is aligned, the cache size must be a power of 2
+        if cache_align and not self._is_power_of_two(cache_size):
+            raise ValueError(f'Cache size must be a power of 2 when aligned, was: {cache_size}')
+
+        # Init attributes
+        self.buffer_size = size
+        self.num_readers = num_readers
+
+        # Init SharedMemory
+        # Note that track = create because only the create should track the SharedBuffer
+        # in standalone Python processes (see https://docs.python.org/3/library/multiprocessing.shared_memory.html
+        # , doesn't matter on Windows)
+        super().__init__(name, create, size, track = create)
+
+        #TODO track reader and writer state with metadata
+
+        #TODO setup local views/fields used by rest of methods
+
+    @staticmethod
+    def _is_power_of_two(n: int) -> bool:
+        """
+        Checks whether an input number is a power of two.
+
+        Args:
+            n: Input value to check.
+
+        Returns:
+            bool: Whether n is a power of two.
+
+        """
+
+        # Since powers of 2 are formatted like 8 = 1000 in binary, a fast way to check
+        # is to use bitwise & with n - 1, since it will have the form 7 = 0111
+        return n > 0 and not (n & (n - 1))
 
     def close(self) -> None:
         """
