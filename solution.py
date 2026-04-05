@@ -200,8 +200,6 @@ class SharedBuffer(shared_memory.SharedMemory):
         else:
             stored_bytes = self.get_write_pos() - self.get_slowest_reader_position()
 
-        print(f'Stored bytes: {stored_bytes}')
-
         # Then the pressure is just the stored_bytes as a percentage of total buffer size
         return (100 * stored_bytes) // self.buffer_size
 
@@ -364,15 +362,15 @@ class SharedBuffer(shared_memory.SharedMemory):
         if self._position + actual_size > self.buffer_size:
             split = True
             # First part of memory view is at the end of the buffer
-            mv1 = self.buf[self._position:]
+            mv1 = self._data_view[self._position:]
 
             # Second part of memory view (wrapped around) is at beginning
             # Subtract 1 since position is 0-indexed
             remaining_bytes = actual_size - (self.buffer_size - self._position - 1)
-            mv2 = self.buf[0:remaining_bytes]
+            mv2 = self._data_view[0:remaining_bytes]
         else:
             split = False
-            mv1 = self.buf[self._position:self._position + actual_size]
+            mv1 = self._data_view[self._position:self._position + actual_size]
             mv2 = None
 
         return mv1, mv2, actual_size, split
@@ -493,11 +491,9 @@ class SharedBuffer(shared_memory.SharedMemory):
         #TODO move num_readers, data size, etc. into header
         for i in range(self.num_readers):
             offset = self._get_reader_header_offset(i)
-            print(f'i: {i} Offset: {offset}')
             # Active is 1 slot over
             active = struct.unpack_from('Q', self._metadata_view, offset +
                                         HEADER_SLOT_SIZE)[0]
-            print(f'In slowest reader, active: {active}')
 
             if active == 1:
                 read_pos = struct.unpack_from('Q', self._metadata_view, offset)[0]
