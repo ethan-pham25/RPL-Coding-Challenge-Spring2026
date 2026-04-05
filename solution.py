@@ -274,7 +274,13 @@ class SharedBuffer(shared_memory.SharedMemory):
         by the tests to ensure externally updated reader positions are observed.
         """
         # Lack of writer validation is intentional, as all buffers can report this
-        raise NotImplementedError("TODO: implement SharedBuffer.compute_max_amount_writable")
+        # If there are no active readers, the writer can write the whole buffer
+        slowest_reader_pos = self.get_slowest_reader_position()
+        if slowest_reader_pos is None:
+            return self.buffer_size
+        else:
+            # Otherwise we can write up to the slowest active reader
+            return SharedBuffer.writer_position - slowest_reader_pos
 
     def jump_to_writer(self) -> None:
         """
