@@ -367,10 +367,10 @@ class SharedBuffer(shared_memory.SharedMemory):
         # 1. If src fits into mv1 completely, copy it all
         # 2. Elif writer_mem_view is split and src fits into the combined storage of mv1 and mv2,
         # copy into mv1 and mv2
-        # 3. Otherwise, src doesn't fit into writer_mem_view, so
-        if len(src) < mv1.nbytes:
+        # 3. Otherwise, src doesn't fit into writer_mem_view, so just return
+        if len(src) <= mv1.nbytes:
             mv1[:len(src)] = src
-        elif split and len(src) < total_size:
+        elif split and len(src) <= total_size:
             mv1 = src[:mv1.nbytes]
             remaining_bytes = len(src) - mv1.nbytes
             mv2[:remaining_bytes] = src[mv1.nbytes:]
@@ -384,7 +384,22 @@ class SharedBuffer(shared_memory.SharedMemory):
         reader position is advanced.
         """
         self._validate_is_reader()
-        raise NotImplementedError("TODO: implement SharedBuffer.simple_read")
+        mv1, mv2, total_size, split = reader_mem_view
+
+        # 1. If dst is smaller or equal to mv1, just copy all of mv1 into dst and return
+        # 2. Elif reader_mem_view is split (and implicitly dst is bigger than mv1),
+        # copy mv1 into dst then as much of mv2 as possible
+        # 3. Otherwise, dst is larger than mv1 and we only have mv1, so just copy in mv1 and return
+        dst_len = len(dst)
+        if dst_len <= mv1.nbytes:
+            dst[:] = mv1[:dst_len]
+        elif split:
+            dst[:mv1.nbytes] = mv1
+            # We either copy mv2 entirely if it can fit in dst, otherwise just the remaining space
+            remaining_bytes = min(dst_len - mv1.nbytes, mv2.nbytes)
+            dst[mv1.nbytes:mv1.nbytes + remaining_bytes] = mv2[:remaining_bytes]
+        else:
+            dst[:mv1.nbytes] = mv1
 
     def write_array(self, arr: np.ndarray) -> int:
         """
