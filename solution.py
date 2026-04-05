@@ -106,10 +106,9 @@ class SharedBuffer(shared_memory.SharedMemory):
 
         # Init attributes
         self._name = name
-        self._buffer_size_power_of_two = self._is_power_of_two(self.size)
+        self._buffer_size_power_of_two = self._is_power_of_two(self.buffer_size)
         self.num_readers = num_readers
         self._reader = reader
-        self._position = 0 # Read position if reader, write position if writer
 
         # Partition the buffer into metadata and data
         self._metadata_view = self.buf[:self.header_size]
@@ -243,8 +242,7 @@ class SharedBuffer(shared_memory.SharedMemory):
         This must fail clearly when called on a writer-only instance.
         """
         self._validate_is_reader()
-        # Update both local and shared reader pos
-        self._position = new_reader_pos
+        # Update shared reader pos
         offset = self._get_reader_header_offset(self._reader)
         struct.pack_into('Q', self._metadata_view, offset, new_reader_pos)
 
@@ -279,8 +277,7 @@ class SharedBuffer(shared_memory.SharedMemory):
         The write position is what makes newly written bytes visible to readers.
         """
         self._validate_is_writer()
-        # Update both local and shared writer pos
-        self._position = new_writer_pos
+        # Update shared writer pos
         # Writer pos has 0 offset in header
         struct.pack_into('Q', self._metadata_view, 0, new_writer_pos)
 
@@ -291,11 +288,9 @@ class SharedBuffer(shared_memory.SharedMemory):
         This is how a writer publishes bytes after copying them into the buffer.
         """
         self._validate_is_writer()
-        # Increment both local and shared writer pos
-        new_position = self._position + inc_amount
-        self._position = new_position
-        # Writer pos is 0 offset in header
-        struct.pack_into('Q', self._metadata_view, 0, new_position)
+        # Increment shared writer pos
+        new_position = self.get_write_pos() + inc_amount
+        self.update_write_pos(new_position)
 
     def inc_reader_pos(self, inc_amount: int) -> None:
         """
@@ -304,10 +299,8 @@ class SharedBuffer(shared_memory.SharedMemory):
         This is how a reader consumes bytes after reading them.
         """
         self._validate_is_reader()
-        new_position = self._position + inc_amount
-        self._position = new_position
-        offset = self._get_reader_header_offset(self._reader)
-        struct.pack_into('Q', self._metadata_view, offset, new_position)
+        new_position = self.get_reader_pos(self._reader) + inc_amount
+        self.update_reader_pos(new_position)
 
     def get_write_pos(self) -> int:
         """
@@ -318,6 +311,22 @@ class SharedBuffer(shared_memory.SharedMemory):
         # Note that lack of writer validation is intentional; see above
         # Get write pos stored in shared header
         return struct.unpack_from('Q', self._metadata_view, 0)[0]
+
+    def get_reader_pos(self, reader_num: int) -> int:
+        """
+        Return the absolute reader position for the given reader num.
+
+        Params:
+            reader_num: The reader to fetch the position for.
+
+        Returns:
+            int: The reader's absolute position.
+
+        """
+
+        # Stored in shared header
+        offset = self._get_reader_header_offset(reader_num)
+        return struct.unpack_from('Q', self._metadata_view, offset)[0]
 
     def compute_max_amount_writable(self, force_rescan: bool = False) -> int:
         """
@@ -350,27 +359,32 @@ class SharedBuffer(shared_memory.SharedMemory):
         if size <= 0:
             return memoryview(bytearray()), None, 0, False
 
+        # Get the current position and usably bytes
         if read:
-            usable_bytes = self.get_write_pos() - self._position
+            current_pos = self.get_reader_pos(self._reader)
+            usable_bytes = self.get_write_pos() - current_pos
         else:
-            usable_bytes = self.buffer_size
+            current_pos = self.get_write_pos()
+            usable_bytes = self.compute_max_amount_writable()
 
         # Clamp actual size
         actual_size = min(size, usable_bytes)
 
+        # Map absolute position to buffer offset
+        start_idx = self.int_to_pos(current_pos)
         # If buffer would overflow, split and wrap around
-        if self._position + actual_size > self.buffer_size:
+        if start_idx + actual_size > self.buffer_size:
             split = True
             # First part of memory view is at the end of the buffer
-            mv1 = self._data_view[self._position:]
+            mv1 = self._data_view[start_idx:]
 
             # Second part of memory view (wrapped around) is at beginning
             # Subtract 1 since position is 0-indexed
-            remaining_bytes = actual_size - (self.buffer_size - self._position - 1)
+            remaining_bytes = actual_size - mv1.nbytes
             mv2 = self._data_view[0:remaining_bytes]
         else:
             split = False
-            mv1 = self._data_view[self._position:self._position + actual_size]
+            mv1 = self._data_view[start_idx : start_idx + actual_size]
             mv2 = None
 
         return mv1, mv2, actual_size, split
@@ -424,9 +438,10 @@ class SharedBuffer(shared_memory.SharedMemory):
         if len(src) <= mv1.nbytes:
             mv1[:len(src)] = src
         elif split and len(src) <= total_size:
-            mv1 = src[:mv1.nbytes]
-            remaining_bytes = len(src) - mv1.nbytes
-            mv2[:remaining_bytes] = src[mv1.nbytes:]
+            # Make sure to use slice assignment and not normal assignment to copy data in
+            mv1[:] = src[:mv1.nbytes]
+            remaining_bytes = len(src) - len(mv1)
+            mv2[:remaining_bytes] = src[len(mv1):]
 
     def simple_read(self, reader_mem_view: RingView, dst: object) -> None:
         """
@@ -473,6 +488,7 @@ class SharedBuffer(shared_memory.SharedMemory):
         try:
             # Otherwise, write into the views
             # If only mv1 exists, we know we can just write the whole array
+            #TODO fix full copying into memory
             input_bytes = bytearray(arr)
             if not split:
                 mv1[:arr.size] = input_bytes[:arr.size]
@@ -542,6 +558,7 @@ class SharedBuffer(shared_memory.SharedMemory):
                                         HEADER_SLOT_SIZE)[0]
 
             if active == 1:
+                # Don't call get reader pos as this would require recalculating offset
                 read_pos = struct.unpack_from('Q', self._metadata_view, offset)[0]
                 active_positions.append(read_pos)
 
