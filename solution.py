@@ -432,16 +432,19 @@ class SharedBuffer(shared_memory.SharedMemory):
         mv1, mv2, total_size, split = writer_mem_view
 
         # 1. If src fits into mv1 completely, copy it all
-        # 2. Elif writer_mem_view is split and src fits into the combined storage of mv1 and mv2,
-        # copy into mv1 and mv2
-        # 3. Otherwise, src doesn't fit into writer_mem_view, so just return
-        if len(src) <= mv1.nbytes:
-            mv1[:len(src)] = src
-        elif split and len(src) <= total_size:
+        # 2. Else, fill up mv1 then put the rest in mv2 if it exists
+        src_len = len(src)
+        write_len = min(src_len, total_size)
+
+        if write_len <= mv1.nbytes:
+            mv1[:write_len] = src[:write_len] # Fits entirely
+        else:
             # Make sure to use slice assignment and not normal assignment to copy data in
-            mv1[:] = src[:mv1.nbytes]
-            remaining_bytes = len(src) - len(mv1)
-            mv2[:remaining_bytes] = src[len(mv1):]
+            mv1[:] = src[:mv1.nbytes] # Fill up mv1
+            remaining_bytes = write_len - mv1.nbytes
+            # If mv2 exists, fill it up until its full or remaining bytes are all written
+            if mv2:
+                mv2[:remaining_bytes] = src[mv1.nbytes:write_len]
 
     def simple_read(self, reader_mem_view: RingView, dst: object) -> None:
         """
