@@ -462,7 +462,31 @@ class SharedBuffer(shared_memory.SharedMemory):
         contract used by the tests expects this method to return `0`.
         """
         self._validate_is_writer()
-        raise NotImplementedError("TODO: implement SharedBuffer.write_array")
+        # First, get memoryviews
+        mv1, mv2, total_writable_bytes, split = self.expose_writer_mem_view(arr.size)
+
+        # Then, if there are not enough writable bytes, write nothing and return that we wrote 0
+        # bytes
+        if arr.size > total_writable_bytes:
+            return 0
+
+        try:
+            # Otherwise, write into the views
+            # If only mv1 exists, we know we can just write the whole array
+            input_bytes = bytearray(arr)
+            if not split:
+                mv1[:arr.size] = input_bytes[:arr.size]
+                return arr.size
+            else:
+                # If they're not contiguous we have to write into mv1 first then mv2
+                mv1[:] = input_bytes[:mv1.nbytes]
+                remaining_bytes = arr.size - mv1.nbytes
+                mv2[:remaining_bytes] = input_bytes[mv1.nbytes:]
+        finally:
+            # Release views that we just generated
+            mv1.release()
+            if mv2 is not None:
+                mv2.release()
 
     def read_array(self, nbytes: int, dtype: np.dtype) -> np.ndarray:
         """
@@ -473,7 +497,29 @@ class SharedBuffer(shared_memory.SharedMemory):
         with the requested dtype.
         """
         self._validate_is_reader()
-        raise NotImplementedError("TODO: implement SharedBuffer.read_array")
+        # First, get the data into memoryviews
+        mv1, mv2, total_readable_bytes, split = self.expose_reader_mem_view(nbytes)
+
+        # Then, if there are not enough readable bytes, return an empty array
+        if nbytes > total_readable_bytes:
+            return np.empty(0, dtype = dtype)
+
+        try:
+            # Otherwise, make an array view of the bytes, starting with mv1, then mv2 if it exists
+            if not split:
+                return np.frombuffer(mv1, dtype = dtype)
+            else:
+                # If they're not contiguous we have to copy unfortunately into a contiguous
+                # bytearray
+                combined = bytearray(total_readable_bytes)
+                combined[:mv1.nbytes] = mv1
+                combined[mv1.nbytes:] = mv2
+                return np.frombuffer(combined, dtype = dtype).copy()
+        finally:
+            # Release views that we just generated
+            mv1.release()
+            if mv2 is not None:
+                mv2.release()
 
     def get_slowest_reader_position(self) -> int | None:
         """
