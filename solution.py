@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from multiprocessing import shared_memory
 from typing import TypeAlias
 
@@ -166,8 +167,11 @@ class SharedBuffer(shared_memory.SharedMemory):
         relative to the slowest active reader.
         """
         # Storage in use relative to the slowest active reader is simply the number of bytes
-        # (difference in position) between the slowest active reader and the writer
+        # (difference in position) between the writer and the slowest active reader
+        stored_bytes = SharedBuffer.writer_position - self.get_slowest_reader_position()
 
+        # Then the pressure is just the stored_bytes as a percentage of total buffer size
+        return math.ceil(stored_bytes / self.buffer_size * 100)
 
     def int_to_pos(self, value: int) -> int:
         """
