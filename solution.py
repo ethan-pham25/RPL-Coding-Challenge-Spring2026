@@ -368,11 +368,11 @@ class SharedBuffer(shared_memory.SharedMemory):
         # 2. Elif writer_mem_view is split and src fits into the combined storage of mv1 and mv2,
         # copy into mv1 and mv2
         # 3. Otherwise, src doesn't fit into writer_mem_view, so
-        if src.len < mv1.nbytes:
-            mv1[:src.len] = src
-        elif split and src.len < total_size:
+        if len(src) < mv1.nbytes:
+            mv1[:len(src)] = src
+        elif split and len(src) < total_size:
             mv1 = src[:mv1.nbytes]
-            remaining_bytes = src.len - mv1.nbytes
+            remaining_bytes = len(src) - mv1.nbytes
             mv2[:remaining_bytes] = src[mv1.nbytes:]
 
     def simple_read(self, reader_mem_view: RingView, dst: object) -> None:
