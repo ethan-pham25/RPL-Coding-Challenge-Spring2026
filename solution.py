@@ -26,6 +26,10 @@ class SharedBuffer(shared_memory.SharedMemory):
     """
 
     _NO_READER = -1
+    # Shared class attributes
+    readers_active = []
+    reader_positions = []
+    writer_position = 0
 
     def __init__(
         self,
@@ -78,6 +82,7 @@ class SharedBuffer(shared_memory.SharedMemory):
         self.buffer_size = size
         self.num_readers = num_readers
         self._reader = reader
+        self._position = 0 # Read position if reader, write position if writer
 
         # Init SharedMemory
         # Note that track = create because only the create should track the SharedBuffer
@@ -86,9 +91,14 @@ class SharedBuffer(shared_memory.SharedMemory):
         super().__init__(name, create, size, track = create)
 
         #TODO finish track reader and writer state with metadata
+
         # Readers are initially inactive
-        if self._reader != self._NO_READER:
+        if self._is_reader():
             self._active = False
+
+        # Shared state/metadata class attributes between SharedBuffer instances
+        SharedBuffer.readers_active = [False] * self.num_readers
+        SharedBuffer.reader_positions = [0] * self.num_readers
 
         #TODO setup local views/fields used by rest of methods
 
@@ -128,7 +138,7 @@ class SharedBuffer(shared_memory.SharedMemory):
         context. Writer-only instances can simply return `self`.
         """
         # If reader, mark self active
-        if self._reader != self._NO_READER:
+        if self._is_reader():
             self._active = True
 
         return self
@@ -141,7 +151,7 @@ class SharedBuffer(shared_memory.SharedMemory):
         close local resources.
         """
         # If reader, mark self inactive
-        if self._reader != self._NO_READER:
+        if self._is_reader():
             self._active = False
 
         self.close()
@@ -171,7 +181,9 @@ class SharedBuffer(shared_memory.SharedMemory):
         This must fail clearly when called on a writer-only instance.
         """
         self._validate_is_reader()
-        raise NotImplementedError("TODO: implement SharedBuffer.update_reader_pos")
+        # Update both local and shared reader pos
+        self._position = new_reader_pos
+        SharedBuffer.reader_positions[self._reader] = new_reader_pos
 
     def set_reader_active(self, active: bool) -> None:
         """
@@ -182,6 +194,8 @@ class SharedBuffer(shared_memory.SharedMemory):
         """
         self._validate_is_reader()
         self._active = active
+        # Update shared activity state
+        SharedBuffer.readers_active[self._reader] = active
 
     def is_reader_active(self) -> bool:
         """
@@ -199,7 +213,9 @@ class SharedBuffer(shared_memory.SharedMemory):
         The write position is what makes newly written bytes visible to readers.
         """
         self._validate_is_writer()
-        raise NotImplementedError("TODO: implement SharedBuffer.update_write_pos")
+        # Update both local and shared writer pos
+        self._position = new_writer_pos
+        SharedBuffer.writer_position = new_writer_pos
 
     def inc_writer_pos(self, inc_amount: int) -> None:
         """
@@ -208,7 +224,9 @@ class SharedBuffer(shared_memory.SharedMemory):
         This is how a writer publishes bytes after copying them into the buffer.
         """
         self._validate_is_writer()
-        raise NotImplementedError("TODO: implement SharedBuffer.inc_writer_pos")
+        # Increment both local and shared writer pos
+        self._position += inc_amount
+        SharedBuffer.writer_position = self._position
 
     def inc_reader_pos(self, inc_amount: int) -> None:
         """
@@ -217,7 +235,8 @@ class SharedBuffer(shared_memory.SharedMemory):
         This is how a reader consumes bytes after reading them.
         """
         self._validate_is_reader()
-        raise NotImplementedError("TODO: implement SharedBuffer.inc_reader_pos")
+        self._position += inc_amount
+        SharedBuffer.reader_positions[self._reader] = self._position
 
     def get_write_pos(self) -> int:
         """
@@ -226,7 +245,7 @@ class SharedBuffer(shared_memory.SharedMemory):
         Readers can use this to resynchronize or compute how much data is available.
         """
         # Note that lack of writer validation is intentional; see above
-        raise NotImplementedError("TODO: implement SharedBuffer.get_write_pos")
+        return SharedBuffer.writer_position
 
     def compute_max_amount_writable(self, force_rescan: bool = False) -> int:
         """
@@ -317,6 +336,26 @@ class SharedBuffer(shared_memory.SharedMemory):
         self._validate_is_reader()
         raise NotImplementedError("TODO: implement SharedBuffer.read_array")
 
+    def _is_reader(self) -> bool:
+        """
+        Returns whether self is a reader.
+
+        Returns:
+            bool: Whether self is a reader.
+
+        """
+        return self._reader != self._NO_READER
+
+    def _is_writer(self) -> bool:
+        """
+        Returns whether self is a writer.
+
+        Returns:
+            bool: Whether self is a writer.
+
+        """
+        return self._reader == self._NO_READER
+
     def _validate_is_reader(self) -> None:
         """
         Raises an exception if the SharedBuffer is not a reader.
@@ -326,7 +365,7 @@ class SharedBuffer(shared_memory.SharedMemory):
 
         """
 
-        if self._reader == self._NO_READER:
+        if self._is_writer():
             raise RuntimeError('Cannot call reader-only method on a SharedBuffer that is a writer!')
 
     def _validate_is_writer(self) -> None:
@@ -338,5 +377,5 @@ class SharedBuffer(shared_memory.SharedMemory):
 
         """
 
-        if self._reader != self._NO_READER:
+        if self._is_reader():
             raise RuntimeError('Cannot call writer-only method on a SharedBuffer that is a reader!')
