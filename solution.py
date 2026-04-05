@@ -85,7 +85,10 @@ class SharedBuffer(shared_memory.SharedMemory):
         # , doesn't matter on Windows)
         super().__init__(name, create, size, track = create)
 
-        #TODO track reader and writer state with metadata
+        #TODO finish track reader and writer state with metadata
+        # Readers are initially inactive
+        if self._reader != self._NO_READER:
+            self._active = False
 
         #TODO setup local views/fields used by rest of methods
 
@@ -124,6 +127,10 @@ class SharedBuffer(shared_memory.SharedMemory):
         Reader instances are expected to mark themselves active while inside the
         context. Writer-only instances can simply return `self`.
         """
+        # If reader, mark self active
+        if self._reader != self._NO_READER:
+            self._active = True
+
         return self
 
     def __exit__(self, *_):
@@ -133,6 +140,10 @@ class SharedBuffer(shared_memory.SharedMemory):
         Reader instances are expected to mark themselves inactive on exit, then
         close local resources.
         """
+        # If reader, mark self inactive
+        if self._reader != self._NO_READER:
+            self._active = False
+
         self.close()
 
     def calculate_pressure(self) -> int:
@@ -170,7 +181,7 @@ class SharedBuffer(shared_memory.SharedMemory):
         writer capacity.
         """
         self._validate_is_reader()
-        raise NotImplementedError("TODO: implement SharedBuffer.set_reader_active")
+        self._active = active
 
     def is_reader_active(self) -> bool:
         """
@@ -179,7 +190,7 @@ class SharedBuffer(shared_memory.SharedMemory):
         This must fail clearly when called on a writer-only instance.
         """
         self._validate_is_reader()
-        raise NotImplementedError("TODO: implement SharedBuffer.is_reader_active")
+        return self._active
 
     def update_write_pos(self, new_writer_pos: int) -> None:
         """
