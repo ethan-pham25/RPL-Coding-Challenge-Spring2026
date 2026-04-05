@@ -27,8 +27,8 @@ class SharedBuffer(shared_memory.SharedMemory):
 
     _NO_READER = -1
     # Shared class attributes
-    readers_active = []
-    reader_positions = []
+    readers_active: dict[int, bool] = {}
+    reader_positions: dict[int, int] = {}
     writer_position = 0
 
     def __init__(
@@ -92,13 +92,15 @@ class SharedBuffer(shared_memory.SharedMemory):
 
         #TODO finish track reader and writer state with metadata
 
-        # Readers are initially inactive
+        # Init shared state/metadata class attributes between SharedBuffer instances
         if self._is_reader():
+            # Readers are initially inactive
             self._active = False
-
-        # Shared state/metadata class attributes between SharedBuffer instances
-        SharedBuffer.readers_active = [False] * self.num_readers
-        SharedBuffer.reader_positions = [0] * self.num_readers
+            SharedBuffer.readers_active[self._reader] = False
+            # Reader position is 0 initially
+            SharedBuffer.reader_positions[self._reader] = 0
+        else:
+            SharedBuffer.writer_position = 0
 
         #TODO setup local views/fields used by rest of methods
 
@@ -163,7 +165,9 @@ class SharedBuffer(shared_memory.SharedMemory):
         Pressure is based on how much of the bounded storage is currently in use
         relative to the slowest active reader.
         """
-        raise NotImplementedError("TODO: implement SharedBuffer.calculate_pressure")
+        # Storage in use relative to the slowest active reader is simply the number of bytes
+        # (difference in position) between the slowest active reader and the writer
+
 
     def int_to_pos(self, value: int) -> int:
         """
@@ -335,6 +339,24 @@ class SharedBuffer(shared_memory.SharedMemory):
         """
         self._validate_is_reader()
         raise NotImplementedError("TODO: implement SharedBuffer.read_array")
+
+    def get_slowest_reader_position(self) -> int | None:
+        """
+        Gets the position, in bytes, of the slowest active reader.
+
+        Returns:
+            int: The position of the slowest active reader.
+            None: If there are no active readers. This means that the
+                writer is free to advance.
+
+        """
+        # The slowest active reader is the active reader with the minimum absolute position
+        # If there are no active readers, return None
+        try:
+            return min(SharedBuffer.reader_positions[i]
+                       for i in range(self.num_readers) if SharedBuffer.readers_active[i])
+        except ValueError:
+            return None
 
     def _is_reader(self) -> bool:
         """

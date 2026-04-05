@@ -35,3 +35,41 @@ class ApplicantSharedBufferContractTests(unittest.TestCase):
             with self.subTest(method=method_name):
                 with self.assertRaises(RuntimeError):
                     getattr(ring, method_name)(*args)
+
+    # This is not part of the challenge contract but this file is still a good place
+    def test_slowest_reader_position_is_none_initially(self):
+        ring = self._make_buffer()
+        self.assertEqual(None, ring.get_slowest_reader_position())
+
+    def test_slowest_reader_position_is_zero_after_activating_reader(self):
+        ring = self._make_buffer()
+        ring.set_reader_active(True)
+        self.assertEqual(0, ring.get_slowest_reader_position())
+
+    def test_slowest_reader_position_is_min_of_active_readers(self):
+        with self._make_buffer(num_readers = 3) as reader0:
+            reader0.set_reader_active(True)
+            reader0.update_reader_pos(100)
+
+            reader1 = SharedBuffer(
+                name = reader0.name,
+                create = False,
+                size = 16,
+                num_readers = 3,
+                reader = 1,
+            )
+            self.addCleanup(cleanup_buffer, reader1)
+            reader1.update_reader_pos(50) # Inactive so shouldn't count
+
+            reader2 = SharedBuffer(
+                name = reader0.name,
+                create = False,
+                size = 16,
+                num_readers = 3,
+                reader = 2,
+            )
+            self.addCleanup(cleanup_buffer, reader2, unlink = True)
+            reader2.set_reader_active(True)
+            reader2.update_reader_pos(1000)
+
+            self.assertEqual(100, reader0.get_slowest_reader_position())
