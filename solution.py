@@ -172,7 +172,7 @@ class SharedBuffer(shared_memory.SharedMemory):
         stored_bytes = SharedBuffer.writer_position - self.get_slowest_reader_position()
 
         # Then the pressure is just the stored_bytes as a percentage of total buffer size
-        return math.ceil(stored_bytes / self.buffer_size * 100)
+        return (100 * stored_bytes) // self.buffer_size
 
     def int_to_pos(self, value: int) -> int:
         """
@@ -292,20 +292,24 @@ class SharedBuffer(shared_memory.SharedMemory):
         self._validate_is_reader()
         raise NotImplementedError("TODO: implement SharedBuffer.jump_to_writer")
 
-    def _make_memory_views(self, size: int):
+    def _make_memory_views(self, size: int, read: bool):
         # Guard clause to save time
         if size <= 0:
             return memoryview(bytearray()), None, 0, False
 
-        readable_bytes = SharedBuffer.writer_position - self._position
+        if read:
+            usable_bytes = SharedBuffer.writer_position - self._position
+        else:
+            usable_bytes = self.buffer_size
+
         # Clamp actual size
-        actual_size = min(size, readable_bytes)
+        actual_size = min(size, usable_bytes)
 
         # If buffer would overflow, split and wrap around
         if self._position + actual_size > self.buffer_size:
             split = True
             # First part of memory view is at the end of the buffer
-            mv1 = self.buf[self._position:].toreadonly()
+            mv1 = self.buf[self._position:]
 
             # Second part of memory view (wrapped around) is at beginning
             # Subtract 1 since position is 0-indexed
@@ -332,7 +336,7 @@ class SharedBuffer(shared_memory.SharedMemory):
         available rather than raising.
         """
         self._validate_is_writer()
-        return self._make_memory_views(size)
+        return self._make_memory_views(size, False)
 
     def expose_reader_mem_view(self, size: int) -> RingView:
         """
@@ -342,7 +346,7 @@ class SharedBuffer(shared_memory.SharedMemory):
         are currently readable, clamp to the amount available rather than raising.
         """
         self._validate_is_reader()
-        mv1, mv2, actual_size, split = self._make_memory_views(size)
+        mv1, mv2, actual_size, split = self._make_memory_views(size, True)
         mv1 = mv1.toreadonly()
         if mv2 is not None:
             mv2 = mv2.toreadonly()
@@ -358,7 +362,18 @@ class SharedBuffer(shared_memory.SharedMemory):
         writer position is advanced.
         """
         self._validate_is_writer()
-        raise NotImplementedError("TODO: implement SharedBuffer.simple_write")
+        mv1, mv2, total_size, split = writer_mem_view
+
+        # 1. If src fits into mv1 completely, copy it all
+        # 2. Elif writer_mem_view is split and src fits into the combined storage of mv1 and mv2,
+        # copy into mv1 and mv2
+        # 3. Otherwise, src doesn't fit into writer_mem_view, so
+        if src.len < mv1.nbytes:
+            mv1[:src.len] = src
+        elif split and src.len < total_size:
+            mv1 = src[:mv1.nbytes]
+            remaining_bytes = src.len - mv1.nbytes
+            mv2[:remaining_bytes] = src[mv1.nbytes:]
 
     def simple_read(self, reader_mem_view: RingView, dst: object) -> None:
         """
