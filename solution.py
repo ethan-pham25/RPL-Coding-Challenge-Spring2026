@@ -290,7 +290,7 @@ class SharedBuffer(shared_memory.SharedMemory):
         no longer retained.
         """
         self._validate_is_reader()
-        raise NotImplementedError("TODO: implement SharedBuffer.jump_to_writer")
+        self.update_reader_pos(SharedBuffer.writer_position)
 
     def _make_memory_views(self, size: int, read: bool):
         # Guard clause to save time
