@@ -81,6 +81,7 @@ class SharedBuffer(shared_memory.SharedMemory):
         # Init attributes
         self._name = name
         self.buffer_size = size
+        self._buffer_size_power_of_two = self._is_power_of_two(self.buffer_size)
         self.num_readers = num_readers
         self._reader = reader
         self._position = 0 # Read position if reader, write position if writer
@@ -179,8 +180,18 @@ class SharedBuffer(shared_memory.SharedMemory):
 
         If your design does not use modulo arithmetic internally, you may still
         keep this helper as the mapping from logical positions to buffer offsets.
+
+        Raises:
+            ValueError: If value is less than 0.
         """
-        raise NotImplementedError("TODO: implement SharedBuffer.int_to_pos")
+        if value < 0:
+            raise ValueError(f'Absolute position value must be non-negative, was: {value}')
+        # If the buffer size is a power of two, use bitwise AND optimization (see power of two func)
+        if self._buffer_size_power_of_two:
+            return value & (self.buffer_size - 1)
+        else:
+            # Else just use modulo
+            return value % self.buffer_size
 
     def update_reader_pos(self, new_reader_pos: int) -> None:
         """

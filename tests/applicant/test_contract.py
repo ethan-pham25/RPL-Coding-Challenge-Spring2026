@@ -73,3 +73,16 @@ class ApplicantSharedBufferContractTests(unittest.TestCase):
             reader2.update_reader_pos(1000)
 
             self.assertEqual(100, reader0.get_slowest_reader_position())
+
+    def test_int_to_pos_rejects_negative_values(self):
+        ring = self._make_buffer()
+        with self.assertRaises(ValueError):
+            ring.int_to_pos(-1)
+
+    def test_int_to_pos_correct_for_power_of_two_sized_buffer(self):
+        ring = self._make_buffer()
+        self.assertEqual(ring.int_to_pos(35), 3)
+
+    def test_int_to_pos_correct_for_non_power_of_two_buffer(self):
+        ring = self._make_buffer(size = 1000)
+        self.assertEqual(ring.int_to_pos(2026), 26)
