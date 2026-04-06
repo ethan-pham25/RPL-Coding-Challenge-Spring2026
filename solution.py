@@ -19,7 +19,7 @@ RingView: TypeAlias = tuple[memoryview, memoryview | None, int, bool]
 # 2 num_readers
 # 3 max_bytes_writable
 # 4 pressure
-# 5 dropped_size/reserved
+# 5 slowest_reader_pos
 
 # READER:
 # 0 read_position
@@ -28,6 +28,7 @@ RingView: TypeAlias = tuple[memoryview, memoryview | None, int, bool]
 HEADER_SLOT_SIZE = 8 # 8 bytes for 64-bit integer
 SLOTS_PER_WRITER = 6
 SLOTS_PER_READER = 3
+MAX_HEADER_VALUE = 18446744073709551615 # u64 max value
 
 
 class SharedBuffer(shared_memory.SharedMemory):
@@ -126,9 +127,9 @@ class SharedBuffer(shared_memory.SharedMemory):
         # Precompute reader header indices for fast access (eliminates repeated offset calculations)
         self._reader_header_indices = {}
         for i in range(num_readers):
-            offset = ((SLOTS_PER_WRITER + i * SLOTS_PER_READER) * HEADER_SLOT_SIZE)
+            offset = SLOTS_PER_WRITER + i * SLOTS_PER_READER
             # Store the index directly into the numpy array (divide by 8 since each slot is 8 bytes)
-            self._reader_header_indices[i] = offset // HEADER_SLOT_SIZE
+            self._reader_header_indices[i] = offset
 
     @staticmethod
     def _is_power_of_two(n: int) -> bool:
@@ -197,10 +198,10 @@ class SharedBuffer(shared_memory.SharedMemory):
         # Storage in use relative to the slowest active reader is simply the number of bytes
         # (difference in position) between the writer and the slowest active reader
         slowest_reader_position = self.get_slowest_reader_position()
-        if slowest_reader_position is None:
+        if slowest_reader_position == MAX_HEADER_VALUE: # Means no active readers
             stored_bytes = 0
         else:
-            stored_bytes = self.get_write_pos() - self.get_slowest_reader_position()
+            stored_bytes = self.get_write_pos() - slowest_reader_position
 
         # Then the pressure is just the stored_bytes as a percentage of total buffer size
         return (100 * stored_bytes) // self.buffer_size
@@ -231,9 +232,16 @@ class SharedBuffer(shared_memory.SharedMemory):
         This must fail clearly when called on a writer-only instance.
         """
         self._validate_is_reader()
+
         # Update shared reader pos using numpy array (faster than struct.pack_into)
+        old_pos = self.get_reader_pos(self._reader)
         idx = self._reader_header_indices[self._reader]
         self._header_array[idx] = new_reader_pos
+
+        # Make sure to update the slowest reader pos if this reader was at the slowest
+        # position before getting updated
+        if self.get_slowest_reader_position() == old_pos:
+            self._update_slowest_reader_position()
 
     def set_reader_active(self, active: bool) -> None:
         """
@@ -245,7 +253,17 @@ class SharedBuffer(shared_memory.SharedMemory):
         self._validate_is_reader()
         # Update shared activity state in header using numpy array (eliminate local state)
         idx = self._reader_header_indices[self._reader] + 1
+        was_active = self._header_array[idx]
         self._header_array[idx] = 1 if active else 0
+
+        # If this reader changed state, we may have to update the slowest position
+        if was_active != active:
+            # We only actually update if there were no active readers (nothing to compare to)
+            # or the current position is the slowest position
+            slowest_pos = self.get_slowest_reader_position()
+            if (slowest_pos == MAX_HEADER_VALUE or # No active readers
+                slowest_pos == self.get_reader_pos(self._reader)):
+                self._update_slowest_reader_position()
 
     def is_reader_active(self) -> bool:
         """
@@ -321,10 +339,14 @@ class SharedBuffer(shared_memory.SharedMemory):
         This should take active readers into account. `force_rescan=True` is used
         by the tests to ensure externally updated reader positions are observed.
         """
+        # Force reader positions to be rescanned
+        if force_rescan:
+            self._update_slowest_reader_position()
+
         # Lack of writer validation is intentional, as all buffers can report this
         # If there are no active readers, the writer can write the whole buffer
         slowest_reader_pos = self.get_slowest_reader_position()
-        if slowest_reader_pos is None:
+        if slowest_reader_pos == MAX_HEADER_VALUE: # No active readers
             return self.buffer_size
         else:
             # Otherwise we can write up to the slowest active reader
@@ -334,7 +356,7 @@ class SharedBuffer(shared_memory.SharedMemory):
             if write_pos == slowest_reader_pos: # Empty
                 return self.buffer_size
             else:
-                unread_bytes = self.get_write_pos() - slowest_reader_pos
+                unread_bytes = write_pos - slowest_reader_pos
                 return self.buffer_size - unread_bytes
 
     def jump_to_writer(self) -> None:
@@ -542,33 +564,44 @@ class SharedBuffer(shared_memory.SharedMemory):
         self._release_memory_views(view[0], view[1])
         return np.frombuffer(dst, dtype = dtype)
 
-    def get_slowest_reader_position(self) -> int | None:
+    def get_slowest_reader_position(self) -> int:
         """
         Gets the position, in bytes, of the slowest active reader.
 
         Returns:
-            int: The position of the slowest active reader.
-            None: If there are no active readers. This means that the
-                writer is free to advance.
+            int: The position of the slowest active reader. This will
+                be the sentinel value MAX_HEADER_VALUE if there are
+                no active readers.
 
         """
-        # Use vectorized numpy operations to find slowest active reader
-        # Build active mask and positions using precomputed indices
-        min_active_pos = None
-        
+        # Get cached reader position from header
+        return self._header_array[5]
+
+    def _update_slowest_reader_position(self):
+        """
+        Update the cached slowest reader position.
+
+        This should only be called when it's possible that this value may change,
+        e.g. when the slowest reader moves position.
+
+        """
+        min_active_pos = MAX_HEADER_VALUE
+
         for i in range(self.num_readers):
             # Use precomputed indices for fast access (no offset calculations)
             pos_idx = self._reader_header_indices[i]
             active_idx = pos_idx + 1
-            
-            # Direct array access (no struct unpacking)
+
+            # Only compare active readers
             is_active = self._header_array[active_idx] == 1
             if is_active:
                 read_pos = int(self._header_array[pos_idx])
-                if min_active_pos is None or read_pos < min_active_pos:
+                if read_pos < min_active_pos:
                     min_active_pos = read_pos
-        
-        return min_active_pos
+
+        # Update shared header with new value
+        # Note this may be MAX_HEADER_VALUE if there were no active readers
+        self._header_array[5] = min_active_pos
 
     def _is_reader(self) -> bool:
         """
