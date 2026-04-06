@@ -507,7 +507,6 @@ class SharedBuffer(shared_memory.SharedMemory):
             input_bytes = memoryview(arr).cast('B')
             if not split:
                 mv1[:arr.nbytes] = input_bytes[:arr.nbytes]
-                return arr.nbytes
             else:
                 # If they're not contiguous we have to write into mv1 first then mv2
                 mv1[:] = input_bytes[:mv1.nbytes]
@@ -515,7 +514,9 @@ class SharedBuffer(shared_memory.SharedMemory):
                     remaining_bytes = arr.nbytes - mv1.nbytes
                     mv2[:remaining_bytes] = input_bytes[mv1.nbytes:]
 
-                return arr.nbytes
+            # Whether split or not, increment the writer position and return number of bytes written
+            self.inc_writer_pos(arr.nbytes)
+            return arr.nbytes
         finally:
             # Release views that we just generated
             mv1.release()
@@ -549,7 +550,11 @@ class SharedBuffer(shared_memory.SharedMemory):
                 combined[:mv1.nbytes] = mv1
                 combined[mv1.nbytes:] = mv2
                 return np.frombuffer(combined, dtype = dtype).copy()
+
         finally:
+            # Increment reader count
+            self.inc_reader_pos(nbytes)
+
             # Release views that we just generated
             mv1.release()
             if mv2 is not None:
