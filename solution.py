@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-import struct
 from multiprocessing import shared_memory
 from typing import TypeAlias
 
@@ -20,7 +19,7 @@ RingView: TypeAlias = tuple[memoryview, memoryview | None, int, bool]
 # 2 num_readers
 # 3 max_bytes_writable
 # 4 pressure
-#TODO idk why this 5 dropped_size
+# 5 dropped_size/reserved
 
 # READER:
 # 0 read_position
@@ -113,6 +112,9 @@ class SharedBuffer(shared_memory.SharedMemory):
         # Partition the buffer into metadata and data
         self._metadata_view = self.buf[:self.header_size]
         self._data_view = self.buf[self.header_size:]
+        
+        # Create numpy view of header for efficient int64 access (eliminates struct overhead)
+        self._header_array = np.frombuffer(self._metadata_view, dtype=np.uint64)
 
         # Init shared state/metadata view between SharedBuffer instances
         # On creation only, zero out the header
@@ -120,10 +122,13 @@ class SharedBuffer(shared_memory.SharedMemory):
         # and also makes readers inactive to begin with!
         if create:
             self._metadata_view[:self.header_size] = b'\x00' * self.header_size
-
-        if self._is_reader():
-            # Readers are initially inactive
-            self._active = False
+        
+        # Precompute reader header indices for fast access (eliminates repeated offset calculations)
+        self._reader_header_indices = {}
+        for i in range(num_readers):
+            offset = ((SLOTS_PER_WRITER + i * SLOTS_PER_READER) * HEADER_SLOT_SIZE)
+            # Store the index directly into the numpy array (divide by 8 since each slot is 8 bytes)
+            self._reader_header_indices[i] = offset // HEADER_SLOT_SIZE
 
     @staticmethod
     def _is_power_of_two(n: int) -> bool:
@@ -150,9 +155,8 @@ class SharedBuffer(shared_memory.SharedMemory):
         """
         try:
             super().close()
-            # Release local views
-            self._metadata_view.release()
-            self._data_view.release()
+            # Release local views on SharedMemory at end of lifecycle
+            self._release_memory_views(self._metadata_view, self._data_view)
         except Exception:
             pass
 
@@ -189,7 +193,6 @@ class SharedBuffer(shared_memory.SharedMemory):
         Pressure is based on how much of the bounded storage is currently in use
         relative to the slowest active reader.
         """
-        #TODO can optimize by storing pressure in header
 
         # Storage in use relative to the slowest active reader is simply the number of bytes
         # (difference in position) between the writer and the slowest active reader
@@ -201,20 +204,6 @@ class SharedBuffer(shared_memory.SharedMemory):
 
         # Then the pressure is just the stored_bytes as a percentage of total buffer size
         return (100 * stored_bytes) // self.buffer_size
-
-    def _get_reader_header_offset(self, reader_num: int) -> int:
-        """
-        Gets the starting index of the specified reader's metadata header area.
-
-        Params:
-            reader_num: The reader to get the offset of.
-
-        Returns:
-            int: The header offset, where this instance's metadata starts.
-
-        """
-        return ((SLOTS_PER_WRITER + reader_num * SLOTS_PER_READER)
-                    * HEADER_SLOT_SIZE)
 
     def int_to_pos(self, value: int) -> int:
         """
@@ -242,9 +231,9 @@ class SharedBuffer(shared_memory.SharedMemory):
         This must fail clearly when called on a writer-only instance.
         """
         self._validate_is_reader()
-        # Update shared reader pos
-        offset = self._get_reader_header_offset(self._reader)
-        struct.pack_into('Q', self._metadata_view, offset, new_reader_pos)
+        # Update shared reader pos using numpy array (faster than struct.pack_into)
+        idx = self._reader_header_indices[self._reader]
+        self._header_array[idx] = new_reader_pos
 
     def set_reader_active(self, active: bool) -> None:
         """
@@ -254,12 +243,9 @@ class SharedBuffer(shared_memory.SharedMemory):
         writer capacity.
         """
         self._validate_is_reader()
-        self._active = active
-
-        # Update shared activity state in header
-        offset = self._get_reader_header_offset(self._reader) + HEADER_SLOT_SIZE
-        value = 1 if active else 0
-        struct.pack_into('Q', self._metadata_view, offset, value)
+        # Update shared activity state in header using numpy array (eliminate local state)
+        idx = self._reader_header_indices[self._reader] + 1
+        self._header_array[idx] = 1 if active else 0
 
     def is_reader_active(self) -> bool:
         """
@@ -268,7 +254,9 @@ class SharedBuffer(shared_memory.SharedMemory):
         This must fail clearly when called on a writer-only instance.
         """
         self._validate_is_reader()
-        return self._active
+        # Always read from shared state (single source of truth)
+        idx = self._reader_header_indices[self._reader] + 1
+        return bool(self._header_array[idx])
 
     def update_write_pos(self, new_writer_pos: int) -> None:
         """
@@ -277,9 +265,8 @@ class SharedBuffer(shared_memory.SharedMemory):
         The write position is what makes newly written bytes visible to readers.
         """
         self._validate_is_writer()
-        # Update shared writer pos
-        # Writer pos has 0 offset in header
-        struct.pack_into('Q', self._metadata_view, 0, new_writer_pos)
+        # Update shared writer pos using numpy array (faster than struct.pack_into)
+        self._header_array[0] = new_writer_pos
 
     def inc_writer_pos(self, inc_amount: int) -> None:
         """
@@ -309,8 +296,8 @@ class SharedBuffer(shared_memory.SharedMemory):
         Readers can use this to resynchronize or compute how much data is available.
         """
         # Note that lack of writer validation is intentional; see above
-        # Get write pos stored in shared header
-        return struct.unpack_from('Q', self._metadata_view, 0)[0]
+        # Get write pos using numpy array (faster than struct.unpack_from)
+        return int(self._header_array[0])
 
     def get_reader_pos(self, reader_num: int) -> int:
         """
@@ -323,10 +310,9 @@ class SharedBuffer(shared_memory.SharedMemory):
             int: The reader's absolute position.
 
         """
-
-        # Stored in shared header
-        offset = self._get_reader_header_offset(reader_num)
-        return struct.unpack_from('Q', self._metadata_view, offset)[0]
+        # Stored in shared header using numpy array (faster than struct.unpack_from)
+        idx = self._reader_header_indices[reader_num]
+        return int(self._header_array[idx])
 
     def compute_max_amount_writable(self, force_rescan: bool = False) -> int:
         """
@@ -513,35 +499,22 @@ class SharedBuffer(shared_memory.SharedMemory):
         contract used by the tests expects this method to return `0`.
         """
         self._validate_is_writer()
-        # First, get memoryviews
-        mv1, mv2, total_writable_bytes, split = self.expose_writer_mem_view(arr.nbytes)
+        input_bytes = arr.nbytes
+        max_writable = self.compute_max_amount_writable()
+        if max_writable < input_bytes:
+            return 0 # Cannot fit full array, so contract says to not write anything
 
-        # Then, if there are not enough writable bytes, write nothing and return that we wrote 0
-        # bytes
-        if arr.nbytes > total_writable_bytes:
-            return 0
+        # Get memory view to write into; once input array is converted to bytes,
+        # it can just be written in a simple write (I had some duplicated code before)
+        view = self.expose_writer_mem_view(input_bytes)
+        self.simple_write(view, memoryview(arr).cast('B'))
+        # Since simple_write() does not increment the writer position,
+        # we do it here as it's expected for write_array()
+        self.inc_writer_pos(input_bytes)
 
-        try:
-            # Otherwise, write into the views
-            # If only mv1 exists, we know we can just write the whole array
-            input_bytes = memoryview(arr).cast('B')
-            if not split:
-                mv1[:arr.nbytes] = input_bytes[:arr.nbytes]
-            else:
-                # If they're not contiguous we have to write into mv1 first then mv2
-                mv1[:] = input_bytes[:mv1.nbytes]
-                if mv2 is not None:
-                    remaining_bytes = arr.nbytes - mv1.nbytes
-                    mv2[:remaining_bytes] = input_bytes[mv1.nbytes:]
-
-            # Whether split or not, increment the writer position and return number of bytes written
-            self.inc_writer_pos(arr.nbytes)
-            return arr.nbytes
-        finally:
-            # Release views that we just generated
-            mv1.release()
-            if mv2 is not None:
-                mv2.release()
+        # Release views to free up memory
+        self._release_memory_views(view[0], view[1])
+        return input_bytes
 
     def read_array(self, nbytes: int, dtype: np.dtype) -> np.ndarray:
         """
@@ -553,32 +526,21 @@ class SharedBuffer(shared_memory.SharedMemory):
         """
         self._validate_is_reader()
         # First, get the data into memoryviews
-        mv1, mv2, total_readable_bytes, split = self.expose_reader_mem_view(nbytes)
+        view = self.expose_reader_mem_view(nbytes)
 
         # Then, if there are not enough readable bytes, return an empty array
-        if nbytes > total_readable_bytes:
+        if view[2] < nbytes:
             return np.empty(0, dtype = dtype)
 
-        try:
-            # Otherwise, make an array view of the bytes, starting with mv1, then mv2 if it exists
-            if not split:
-                return np.frombuffer(mv1, dtype = dtype)
-            else:
-                # If they're not contiguous we have to copy unfortunately into a contiguous
-                # bytearray
-                combined = bytearray(total_readable_bytes)
-                combined[:mv1.nbytes] = mv1
-                combined[mv1.nbytes:] = mv2
-                return np.frombuffer(combined, dtype = dtype).copy()
+        # Now, simply read into a bytearray then convert to numpy array for return value
+        dst = bytearray(nbytes) # Empty bytearray to read into
+        self.simple_read(view, dst)
+        # See above; increment reader_pos since simple_read() doesn't do it
+        self.inc_reader_pos(nbytes)
 
-        finally:
-            # Increment reader count
-            self.inc_reader_pos(nbytes)
-
-            # Release views that we just generated
-            mv1.release()
-            if mv2 is not None:
-                mv2.release()
+        # Again, make sure to release views before returning
+        self._release_memory_views(view[0], view[1])
+        return np.frombuffer(dst, dtype = dtype)
 
     def get_slowest_reader_position(self) -> int | None:
         """
@@ -590,23 +552,23 @@ class SharedBuffer(shared_memory.SharedMemory):
                 writer is free to advance.
 
         """
-        # The slowest active reader is the active reader with the minimum absolute position
-        active_positions = []
-
-        #TODO move num_readers, data size, etc. into header
+        # Use vectorized numpy operations to find slowest active reader
+        # Build active mask and positions using precomputed indices
+        min_active_pos = None
+        
         for i in range(self.num_readers):
-            offset = self._get_reader_header_offset(i)
-            # Active is 1 slot over
-            active = struct.unpack_from('Q', self._metadata_view, offset +
-                                        HEADER_SLOT_SIZE)[0]
-
-            if active == 1:
-                # Don't call get reader pos as this would require recalculating offset
-                read_pos = struct.unpack_from('Q', self._metadata_view, offset)[0]
-                active_positions.append(read_pos)
-
-        # If there are no active readers, return None
-        return min(active_positions) if active_positions else None
+            # Use precomputed indices for fast access (no offset calculations)
+            pos_idx = self._reader_header_indices[i]
+            active_idx = pos_idx + 1
+            
+            # Direct array access (no struct unpacking)
+            is_active = self._header_array[active_idx] == 1
+            if is_active:
+                read_pos = int(self._header_array[pos_idx])
+                if min_active_pos is None or read_pos < min_active_pos:
+                    min_active_pos = read_pos
+        
+        return min_active_pos
 
     def _is_reader(self) -> bool:
         """
@@ -651,3 +613,22 @@ class SharedBuffer(shared_memory.SharedMemory):
 
         if self._is_reader():
             raise RuntimeError('Cannot call writer-only method on a SharedBuffer that is a reader!')
+
+    @staticmethod
+    def _release_memory_views(*views: memoryview | None) -> None:
+        """
+        See tests/support.py. Releases memory views to free up space,
+        if they exist.
+
+        Args:
+            *views: Arbitrary amount of views to release.
+
+        """
+
+        for view in views:
+            if view is None:
+                continue
+            try:
+                view.release()
+            except Exception:
+                pass
