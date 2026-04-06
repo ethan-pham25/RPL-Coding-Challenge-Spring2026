@@ -342,7 +342,14 @@ class SharedBuffer(shared_memory.SharedMemory):
             return self.buffer_size
         else:
             # Otherwise we can write up to the slowest active reader
-            return self.get_write_pos() - slowest_reader_pos
+            # If write pos equals slowest reader, we are actually empty not full
+            # And we will keep the writer 1 byte away from the slowest reader when not empty
+            write_pos = self.get_write_pos()
+            if write_pos == slowest_reader_pos: # Empty
+                return self.buffer_size
+            else:
+                # -1 (see above) so we don't hit an ambiguous empty or full state
+                return self.get_write_pos() - slowest_reader_pos - 1
 
     def jump_to_writer(self) -> None:
         """
