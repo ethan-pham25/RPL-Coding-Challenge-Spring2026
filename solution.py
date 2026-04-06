@@ -349,8 +349,7 @@ class SharedBuffer(shared_memory.SharedMemory):
                 return self.buffer_size
             else:
                 unread_bytes = self.get_write_pos() - slowest_reader_pos
-                # -1 (see above) so we don't hit an ambiguous empty or full state
-                return self.buffer_size - unread_bytes - 1
+                return self.buffer_size - unread_bytes
 
     def jump_to_writer(self) -> None:
         """
@@ -465,20 +464,18 @@ class SharedBuffer(shared_memory.SharedMemory):
         self._validate_is_reader()
         mv1, mv2, total_size, split = reader_mem_view
 
-        # 1. If dst is smaller or equal to mv1, just copy all of mv1 into dst and return
-        # 2. Elif reader_mem_view is split (and implicitly dst is bigger than mv1),
-        # copy mv1 into dst then as much of mv2 as possible
-        # 3. Otherwise, dst is larger than mv1 and we only have mv1, so just copy in mv1 and return
+        # 1. If mv1 fits entirely into dst, copy the whole thing
+        # 2. Otherwise, start spilling over into mv2
         dst_len = len(dst)
-        if dst_len <= mv1.nbytes:
-            dst[:] = mv1[:dst_len]
-        elif split:
-            dst[:mv1.nbytes] = mv1
-            # We either copy mv2 entirely if it can fit in dst, otherwise just the remaining space
-            remaining_bytes = min(dst_len - mv1.nbytes, mv2.nbytes)
-            dst[mv1.nbytes:mv1.nbytes + remaining_bytes] = mv2[:remaining_bytes]
+        read_len = min(dst_len, total_size)
+
+        if read_len <= mv1.nbytes:
+            dst[:read_len] = mv1[:read_len]
         else:
-            dst[:mv1.nbytes] = mv1
+            dst[:mv1.nbytes] = mv1[:]
+            # We either copy mv2 entirely if it can fit in dst, otherwise just the remaining space
+            remaining_bytes = read_len - mv1.nbytes
+            dst[mv1.nbytes : read_len] = mv2[:remaining_bytes]
 
     def write_array(self, arr: np.ndarray) -> int:
         """
