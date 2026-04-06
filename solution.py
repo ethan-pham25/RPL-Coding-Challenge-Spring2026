@@ -383,11 +383,14 @@ class SharedBuffer(shared_memory.SharedMemory):
         if start_idx + actual_size > self.buffer_size:
             split = True
             # First part of memory view is at the end of the buffer
-            mv1 = self._data_view[start_idx:]
+            # Clamp to logical buffer boundary (buffer_size), not physical allocation size
+            # If we don't do this, we end up going too far due to the page allocation size
+            # of SharedMemory
+            end_idx = self.buffer_size
+            mv1 = self._data_view[start_idx : end_idx]
 
             # Second part of memory view (wrapped around) is at beginning
-            # Subtract 1 since position is 0-indexed
-            remaining_bytes = actual_size - mv1.nbytes
+            remaining_bytes = actual_size - (end_idx - start_idx)
             mv2 = self._data_view[0:remaining_bytes]
         else:
             split = False
@@ -442,15 +445,17 @@ class SharedBuffer(shared_memory.SharedMemory):
         # 2. Else, fill up mv1 then put the rest in mv2 if it exists
         src_len = len(src)
         write_len = min(src_len, total_size)
+        if write_len <= 0:
+            return
 
-        if write_len <= mv1.nbytes:
+        if not split or write_len <= mv1.nbytes:
             mv1[:write_len] = src[:write_len] # Fits entirely
         else:
             # Make sure to use slice assignment and not normal assignment to copy data in
             mv1[:] = src[:mv1.nbytes] # Fill up mv1
             remaining_bytes = write_len - mv1.nbytes
             # If mv2 exists, fill it up until its full or remaining bytes are all written
-            if mv2:
+            if mv2 is not None:
                 mv2[:remaining_bytes] = src[mv1.nbytes:write_len]
 
     def simple_read(self, reader_mem_view: RingView, dst: object) -> None:
@@ -468,14 +473,17 @@ class SharedBuffer(shared_memory.SharedMemory):
         # 2. Otherwise, start spilling over into mv2
         dst_len = len(dst)
         read_len = min(dst_len, total_size)
+        if read_len <= 0:
+            return
 
-        if read_len <= mv1.nbytes:
+        if not split or read_len <= mv1.nbytes:
             dst[:read_len] = mv1[:read_len]
         else:
             dst[:mv1.nbytes] = mv1[:]
-            # We either copy mv2 entirely if it can fit in dst, otherwise just the remaining space
-            remaining_bytes = read_len - mv1.nbytes
-            dst[mv1.nbytes : read_len] = mv2[:remaining_bytes]
+            if mv2 is not None:
+                # We either copy mv2 entirely if it can fit in dst, otherwise just the remaining space
+                remaining_bytes = read_len - mv1.nbytes
+                dst[mv1.nbytes : read_len] = mv2[:remaining_bytes]
 
     def write_array(self, arr: np.ndarray) -> int:
         """
@@ -496,16 +504,18 @@ class SharedBuffer(shared_memory.SharedMemory):
         try:
             # Otherwise, write into the views
             # If only mv1 exists, we know we can just write the whole array
-            #TODO fix full copying into memory
-            input_bytes = bytearray(arr)
+            input_bytes = memoryview(arr).cast('B')
             if not split:
                 mv1[:arr.nbytes] = input_bytes[:arr.nbytes]
                 return arr.nbytes
             else:
                 # If they're not contiguous we have to write into mv1 first then mv2
                 mv1[:] = input_bytes[:mv1.nbytes]
-                remaining_bytes = arr.nbytes - mv1.nbytes
-                mv2[:remaining_bytes] = input_bytes[mv1.nbytes:]
+                if mv2 is not None:
+                    remaining_bytes = arr.nbytes - mv1.nbytes
+                    mv2[:remaining_bytes] = input_bytes[mv1.nbytes:]
+
+                return arr.nbytes
         finally:
             # Release views that we just generated
             mv1.release()
