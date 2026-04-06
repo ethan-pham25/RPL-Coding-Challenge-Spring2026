@@ -361,7 +361,22 @@ class SharedBuffer(shared_memory.SharedMemory):
         self._validate_is_reader()
         self.update_reader_pos(self.get_write_pos())
 
-    def _make_memory_views(self, size: int, read: bool):
+    def _make_memory_views(self, size: int, read: bool) -> RingView:
+        """
+        Makes a RingView (two memory views and associated metadata),
+        given the number of bytes to view and whether the views should be
+        writable.
+
+        Args:
+            size: The number of bytes to include in the views.
+            read: Whether the views should be view-only.
+
+        Returns:
+            RingView: The memory views, the number of accessible bytes, and whether
+                the views were split (wrapped around the buffer).
+
+        """
+
         # Guard clause to save time
         if size <= 0:
             return memoryview(bytearray()), None, 0, False
@@ -369,7 +384,12 @@ class SharedBuffer(shared_memory.SharedMemory):
         # Get the current position and usably bytes
         if read:
             current_pos = self.get_reader_pos(self._reader)
+            # If the writer is more than self.buffer size ahead of the reader,
+            # we can't read any bytes right now; return 0 and resync to writer
             usable_bytes = self.get_write_pos() - current_pos
+            if usable_bytes > self.buffer_size:
+                self.jump_to_writer()
+                return memoryview(bytearray()), None, 0, False
         else:
             current_pos = self.get_write_pos()
             usable_bytes = self.compute_max_amount_writable()
