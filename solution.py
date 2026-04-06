@@ -348,8 +348,9 @@ class SharedBuffer(shared_memory.SharedMemory):
             if write_pos == slowest_reader_pos: # Empty
                 return self.buffer_size
             else:
+                unread_bytes = self.get_write_pos() - slowest_reader_pos
                 # -1 (see above) so we don't hit an ambiguous empty or full state
-                return self.get_write_pos() - slowest_reader_pos - 1
+                return self.buffer_size - unread_bytes - 1
 
     def jump_to_writer(self) -> None:
         """
@@ -488,11 +489,11 @@ class SharedBuffer(shared_memory.SharedMemory):
         """
         self._validate_is_writer()
         # First, get memoryviews
-        mv1, mv2, total_writable_bytes, split = self.expose_writer_mem_view(arr.size)
+        mv1, mv2, total_writable_bytes, split = self.expose_writer_mem_view(arr.nbytes)
 
         # Then, if there are not enough writable bytes, write nothing and return that we wrote 0
         # bytes
-        if arr.size > total_writable_bytes:
+        if arr.nbytes > total_writable_bytes:
             return 0
 
         try:
@@ -501,12 +502,12 @@ class SharedBuffer(shared_memory.SharedMemory):
             #TODO fix full copying into memory
             input_bytes = bytearray(arr)
             if not split:
-                mv1[:arr.size] = input_bytes[:arr.size]
-                return arr.size
+                mv1[:arr.nbytes] = input_bytes[:arr.nbytes]
+                return arr.nbytes
             else:
                 # If they're not contiguous we have to write into mv1 first then mv2
                 mv1[:] = input_bytes[:mv1.nbytes]
-                remaining_bytes = arr.size - mv1.nbytes
+                remaining_bytes = arr.nbytes - mv1.nbytes
                 mv2[:remaining_bytes] = input_bytes[mv1.nbytes:]
         finally:
             # Release views that we just generated
