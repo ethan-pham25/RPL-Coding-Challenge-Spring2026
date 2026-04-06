@@ -109,21 +109,24 @@ class SharedBuffer(shared_memory.SharedMemory):
         self._buffer_size_power_of_two = self._is_power_of_two(self.buffer_size)
         self.num_readers = num_readers
         self._reader = reader
+        self._position = 0
 
         # Partition the buffer into metadata and data
         self._metadata_view = self.buf[:self.header_size]
         self._data_view = self.buf[self.header_size:]
         
-        # Create numpy view of header for efficient int64 access (eliminates struct overhead)
-        self._header_array = np.frombuffer(self._metadata_view, dtype=np.uint64)
-
         # Init shared state/metadata view between SharedBuffer instances
         # On creation only, zero out the header
         # Importantly, this makes all the reader and writer positions 0 cheaply,
         # and also makes readers inactive to begin with!
         if create:
             self._metadata_view[:self.header_size] = b'\x00' * self.header_size
-        
+
+        # Create numpy view of header for efficient int64 access (eliminates struct overhead)
+        self._header_array = np.frombuffer(self._metadata_view, dtype=np.uint64)
+        self._reader_pos_array = self._header_array[6::3]
+        self._reader_pos_array.fill(MAX_HEADER_VALUE) # Set inactive sentinel on init
+
         # Precompute reader header indices for fast access (eliminates repeated offset calculations)
         self._reader_header_indices = {}
         for i in range(num_readers):
@@ -236,7 +239,9 @@ class SharedBuffer(shared_memory.SharedMemory):
         # Update shared reader pos using numpy array (faster than struct.pack_into)
         old_pos = self.get_reader_pos(self._reader)
         idx = self._reader_header_indices[self._reader]
+
         self._header_array[idx] = new_reader_pos
+        self._position = new_reader_pos # Update local
 
         # Make sure to update the slowest reader pos if this reader was at the slowest
         # position before getting updated
@@ -255,6 +260,12 @@ class SharedBuffer(shared_memory.SharedMemory):
         idx = self._reader_header_indices[self._reader] + 1
         was_active = self._header_array[idx]
         self._header_array[idx] = 1 if active else 0
+
+        # Optimization so we don't have to check if a reader is active
+        if not active:
+            self._reader_pos_array[self._reader] = MAX_HEADER_VALUE
+        elif not was_active and active:
+            self._reader_pos_array[self._reader] = self._position
 
         # If this reader changed state, we may have to update the slowest position
         if was_active != active:
@@ -329,8 +340,13 @@ class SharedBuffer(shared_memory.SharedMemory):
 
         """
         # Stored in shared header using numpy array (faster than struct.unpack_from)
+        # If the reader pos is the inactive sentinel, return the local pos instead
         idx = self._reader_header_indices[reader_num]
-        return int(self._header_array[idx])
+        reader_pos = int(self._header_array[idx])
+        if reader_pos == MAX_HEADER_VALUE:
+            return self._position
+        else:
+            return reader_pos
 
     def compute_max_amount_writable(self, force_rescan: bool = False) -> int:
         """
@@ -585,19 +601,23 @@ class SharedBuffer(shared_memory.SharedMemory):
         e.g. when the slowest reader moves position.
 
         """
+        # 1. NP MIN
+        # min_active_pos = np.min(
+        #     self._reader_pos_array,
+        #     initial = MAX_HEADER_VALUE
+        # )
+
+        # 2. PYTHON MIN
+        # min_active_pos = min(self._reader_pos_array)
+
+        # 3. PYTHON FOR, for some reason this is faster for single reader but np min
+        # may be better for multi-reader
+        # Initial value
         min_active_pos = MAX_HEADER_VALUE
-
         for i in range(self.num_readers):
-            # Use precomputed indices for fast access (no offset calculations)
-            pos_idx = self._reader_header_indices[i]
-            active_idx = pos_idx + 1
-
-            # Only compare active readers
-            is_active = self._header_array[active_idx] == 1
-            if is_active:
-                read_pos = int(self._header_array[pos_idx])
-                if read_pos < min_active_pos:
-                    min_active_pos = read_pos
+            read_pos = self._reader_pos_array[i]
+            if read_pos < min_active_pos:
+                min_active_pos = read_pos
 
         # Update shared header with new value
         # Note this may be MAX_HEADER_VALUE if there were no active readers
